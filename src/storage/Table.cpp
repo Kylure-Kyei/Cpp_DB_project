@@ -1,76 +1,100 @@
 #include "Table.h"
-#include "common/Logger.h"
-#include <cerrno>
-#include "common/Logger.h"
-#include <cstring>
-#include "common/Logger.h"
-#include <cstdint>
-#include "common/Logger.h"
+#include "../common/MyString.h"
+#include "../index/DiskBPlusTree.h"
+#include "../storage/PageManager.h"
 #include <cstdio>
-#include "common/Logger.h"
+#include <cstring>
+#include <cerrno>
+#include <cstdint>
 
-Table::Table(const char *name) : tableName(name), dataFile(nullptr), rowCount(0) {}
+Table::Table(const char* name)
+    : tableName(name), dataFile(nullptr), rowCount(0),
+      indexPageManager_(nullptr), index_(nullptr), primaryKeyCol_(-1) {}
 
 Table::~Table() {
-    if (dataFile) {
-        fclose(dataFile);
-    }
+    if (dataFile) fclose(dataFile);
+    delete index_;
+    delete indexPageManager_;
 }
 
 bool Table::init() {
-     MyString filename = tableName;
+    // 1. 打开/创建数据文件
+    MyString filename = tableName;
     filename += ".dat";
-
-    // 以读写模式打开，如果不存在则创建
     dataFile = fopen(filename.c_str(), "r+b");
     if (!dataFile) {
-        // 尝试以创建模式打开
         dataFile = fopen(filename.c_str(), "w+b");
         if (!dataFile) {
-            printf("Error: Cannot create table file %s: %s\n", filename.c_str(), strerror(errno));
+            printf("Error: Cannot create data file %s: %s\n", filename.c_str(), strerror(errno));
             return false;
         }
     }
+
+    // 2. 打开/创建索引文件（.idx）的页管理器
+    MyString idxName = tableName;
+    idxName += ".idx";
+    try {
+        indexPageManager_ = new PageManager(idxName.c_str());
+    } catch (...) {
+        printf("Warning: Could not open index file %s. Index disabled.\n", idxName.c_str());
+    }
+
     return true;
 }
 
-void Table::addColumn(const ColumnSchema &col) {
+void Table::addColumn(const ColumnSchema& col) {
     schema.push_back(col);
 }
 
-bool Table::insertRow(const Row &row) {
+void Table::setPrimaryKey(int colIndex) {
+    if (colIndex < 0 || colIndex >= static_cast<int>(schema.size())) return;
+    primaryKeyCol_ = colIndex;
+    // 如果页管理器已存在，创建 B+ 树索引
+    if (indexPageManager_ && !index_) {
+        index_ = new DiskBPlusTree(indexPageManager_, 4); // 阶数 4
+    }
+}
+
+int Table::extractPrimaryKey(const Row& row) const {
+    if (primaryKeyCol_ < 0 || primaryKeyCol_ >= static_cast<int>(row.getFieldCount()))
+        return -1;
+    const FieldValue* fv = row.getField(primaryKeyCol_);
+    if (!fv || fv->type != TYPE_INT) return -1;
+    return fv->int_val;
+}
+
+bool Table::insertRow(const Row& row) {
     if (!dataFile) return false;
 
     MyVector<char> buffer;
-    if (!serializeRow(row, buffer)) {
-        return false;
-    }
+    if (!serializeRow(row, buffer)) return false;
 
-    // 写入长度前缀（简化协议）
     uint32_t len = static_cast<uint32_t>(buffer.size());
     fwrite(&len, sizeof(len), 1, dataFile);
     fwrite(buffer.data(), 1, buffer.size(), dataFile);
-    fflush(dataFile); // 强制刷盘（为了简单，实际项目需优化）
+    fflush(dataFile);
+
+    // 更新索引：将主键值和行号（rowCount）插入 B+ 树
+    if (index_ && primaryKeyCol_ >= 0) {
+        int key = extractPrimaryKey(row);
+        if (key != -1) {
+            index_->insert(key, static_cast<int>(rowCount));
+        }
+    }
+
     rowCount++;
     return true;
 }
 
-bool Table::getRow(long rowId, Row &row) {
-    // 为了简单，这里演示全表扫描找第rowId行
-    // 实际项目中这里应该是根据索引定位，或者维护行偏移表
+bool Table::getRow(long rowId, Row& row) {
     if (!dataFile) return false;
     rewind(dataFile);
-
     for (long i = 0; i <= rowId; ++i) {
         uint32_t len;
-        if (fread(&len, sizeof(len), 1, dataFile) != 1) {
-            return false; // 读取结束或错误
-        }
+        if (fread(&len, sizeof(len), 1, dataFile) != 1) return false;
         MyVector<char> buf;
         buf.resize(len);
-        if (fread(buf.data(), 1, len, dataFile) != len) {
-            return false;
-        }
+        if (fread(buf.data(), 1, len, dataFile) != len) return false;
         if (i == rowId) {
             return deserializeRow(buf.data(), len, row);
         }
@@ -78,14 +102,21 @@ bool Table::getRow(long rowId, Row &row) {
     return false;
 }
 
-const MyVector<ColumnSchema> &Table::getSchema() const {
+bool Table::getRowByKey(int key, Row& row) {
+    if (!index_ || primaryKeyCol_ < 0) return false;
+    auto result = index_->search(key);
+    if (!result.has_value()) return false;
+    long rowId = result.value();
+    return getRow(rowId, row);
+}
+
+const MyVector<ColumnSchema>& Table::getSchema() const {
     return schema;
 }
 
-// --- 私有序列化实现 ---
+// ========== 序列化/反序列化实现（与之前相同） ==========
 
-bool Table::serializeRow(const Row &row, MyVector<char> &buffer) {
-    // 简单的序列化：[字段数][类型1][值1长度/内容]...
+bool Table::serializeRow(const Row& row, MyVector<char>& buffer) {
     uint32_t fieldCount = static_cast<uint32_t>(row.getFieldCount());
     buffer.resize(sizeof(fieldCount));
     memcpy(buffer.data(), &fieldCount, sizeof(fieldCount));
@@ -95,8 +126,7 @@ bool Table::serializeRow(const Row &row, MyVector<char> &buffer) {
         const FieldValue* val = row.getField(i);
         if (!val) continue;
 
-        // 扩展缓冲区
-        buffer.resize(offset + 1 + sizeof(uint32_t)); // type + len
+        buffer.resize(offset + 1 + sizeof(uint32_t));
         buffer[offset] = static_cast<char>(val->type);
         offset += 1;
 
@@ -133,7 +163,7 @@ bool Table::serializeRow(const Row &row, MyVector<char> &buffer) {
     return true;
 }
 
-bool Table::deserializeRow(const char *buffer, size_t size, Row &row) {
+bool Table::deserializeRow(const char* buffer, size_t size, Row& row) {
     if (size < sizeof(uint32_t)) return false;
     uint32_t fieldCount;
     memcpy(&fieldCount, buffer, sizeof(fieldCount));
@@ -173,7 +203,6 @@ bool Table::deserializeRow(const char *buffer, size_t size, Row &row) {
                 offset += sizeof(str_len);
                 if (offset + str_len > size) break;
                 MyString str;
-                // 简单处理，假设字符串不包含\0
                 char temp[256] = {0};
                 memcpy(temp, &buffer[offset], str_len < 255 ? str_len : 255);
                 str = temp;

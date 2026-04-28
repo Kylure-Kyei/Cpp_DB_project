@@ -7,6 +7,8 @@
 #include "../index/BPlusTree.h"
 #include "../storage/PageManager.h"
 #include "../index/DiskBPlusTree.h"
+#include "../storage/Table.h"
+#include "../storage/Row.h"  
 
 // 辅助：比较 MyString 与 C 字符串
 bool str_eq(const MyString& a, const char* b) {
@@ -174,6 +176,80 @@ int main() {
 
         remove(idxFile);
         printf("DiskBPlusTree tests passed.\n");
+    }
+
+        // -------- Table + DiskBPlusTree 集成测试 --------
+    {
+        const char* tabName = "test_user";
+        Table table(tabName);
+        table.init();
+        table.addColumn(ColumnSchema("id", TYPE_INT, false));
+        table.addColumn(ColumnSchema("name", TYPE_STRING, true));
+        table.setPrimaryKey(0);   // 第一列为主键
+
+        // 插入几行
+        Row row1; row1.addField(FieldValue(1)); row1.addField(FieldValue("Alice"));
+        Row row2; row2.addField(FieldValue(2)); row2.addField(FieldValue("Bob"));
+        Row row3; row3.addField(FieldValue(3)); row3.addField(FieldValue("Charlie"));
+        assert(table.insertRow(row1));
+        assert(table.insertRow(row2));
+        assert(table.insertRow(row3));
+
+        // 用主键查询
+        Row fetched;
+        assert(table.getRowByKey(2, fetched));
+        assert(fetched.getFieldCount() == 2);
+        // 比较字段（简单比较）
+        const FieldValue* fv = fetched.getField(0);
+        assert(fv && fv->type == TYPE_INT && fv->int_val == 2);
+        fv = fetched.getField(1);
+        assert(fv && fv->type == TYPE_STRING && strcmp(fv->str_val.c_str(), "Bob") == 0);
+
+        // 查询不存在的键
+        assert(!table.getRowByKey(99, fetched));
+
+        // 清理测试文件（可选，为了不影响后续测试）
+        remove("test_user.dat");
+        remove("test_user.idx");
+        printf("Table+Index integration tests passed.\n");
+    }
+
+        // -------- DiskBPlusTree 删除测试 --------
+    {
+        const char* idxFile = "test_del.idx";
+        remove(idxFile);
+        PageManager pm(idxFile);
+        DiskBPlusTree tree(&pm, 4);
+        // 构造数据
+        int keys[] = {5, 2, 8, 9, 1, 3, 7, 6, 4};
+        for (int k : keys) tree.insert(k, k * 10);
+        
+        // 验证全部存在
+        for (int k : keys) {
+            auto r = tree.search(k);
+            assert(r.has_value() && r.value() == k * 10);
+        }
+
+        // 删除叶子节点中的键（不触发合并）
+        assert(tree.remove(8));
+        assert(!tree.search(8).has_value());
+        
+        // 删除一个键，可能触发借用
+        assert(tree.remove(1));
+        assert(!tree.search(1).has_value());
+        
+        // 继续删除，触发合并？
+        assert(tree.remove(9));
+        assert(!tree.search(9).has_value());
+        
+        // 检查剩余键
+        assert(tree.search(5).value() == 50);
+        assert(tree.search(2).value() == 20);
+        assert(tree.search(3).value() == 30);
+        assert(tree.search(7).value() == 70);
+        
+        remove(idxFile);
+        printf("DiskBPlusTree delete tests passed.\n");
     }
 
     printf("\nAll core tests passed.\n");

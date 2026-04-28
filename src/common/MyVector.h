@@ -53,6 +53,17 @@ public:
 
     // 11. 移除最后一个
     void pop_back();
+
+        // 返回最后一个元素的引用
+    T& back() {
+        if (size_ == 0) throw std::out_of_range("MyVector::back: empty");
+        return data_[size_ - 1];
+    }
+    const T& back() const {
+        if (size_ == 0) throw std::out_of_range("MyVector::back: empty");
+        return data_[size_ - 1];
+    }
+
     // 返回指向第一个元素的迭代器
     T* begin() { return data_; }
 

@@ -2,70 +2,55 @@
 #define MINIDB_TABLE_H
 
 #include "Row.h"
-#include "common/Logger.h"
 #include "../common/MyString.h"
-#include "common/Logger.h"
 #include "../common/MyVector.h"
-#include "common/Logger.h"
 #include <cstdio>
-#include "common/Logger.h"
 
-/**
- * @brief 表元数据：列定义
- */
+// 前置声明，避免循环包含
+class PageManager;
+class DiskBPlusTree;
+
 struct ColumnSchema {
-    MyString name;      // 列名
-    FieldType type;     // 数据类型
-    bool nullable;      // 是否允许为空
+    MyString name;
+    FieldType type;
+    bool nullable;
 
     ColumnSchema() = default;
-
     ColumnSchema(const char* n, FieldType t, bool null = false)
         : name(n), type(t), nullable(null) {}
 };
 
-/**
- * @brief 表类
- * 负责管理数据文件（.dat）的读写
- */
 class Table {
 private:
-    MyString tableName;                 // 表名
-    MyVector<ColumnSchema> schema;      // 表结构
-    FILE* dataFile;                     // 数据文件指针 (.dat)
-    long rowCount;                      // 行数统计
+    MyString tableName;
+    MyVector<ColumnSchema> schema;
+    FILE* dataFile;
+    long rowCount;
 
-    // 私有辅助函数：序列化/反序列化
+    // 索引相关成员
+    PageManager* indexPageManager_;      // 管理 .idx 文件
+    DiskBPlusTree* index_;               // 主键 B+ 树索引
+    int primaryKeyCol_;                  // 主键列索引（-1 表示无索引）
+
+    // 序列化辅助
     bool serializeRow(const Row& row, MyVector<char>& buffer);
     bool deserializeRow(const char* buffer, size_t size, Row& row);
+
+    // 从行中提取主键值（假设主键列为 INT 类型）
+    int extractPrimaryKey(const Row& row) const;
 
 public:
     Table(const char* name);
     ~Table();
 
-    /**
-     * @brief 初始化表（创建文件或打开文件）
-     */
-    bool init();
-
-    /**
-     * @brief 添加列定义
-     */
+    bool init();                           // 同时打开数据文件和索引文件
     void addColumn(const ColumnSchema& col);
+    void setPrimaryKey(int colIndex);      // 设置主键列，并激活索引
 
-    /**
-     * @brief 插入一行数据
-     */
-    bool insertRow(const Row& row);
+    bool insertRow(const Row& row);        // 插入时自动更新索引
+    bool getRow(long rowId, Row& row);     // 按行号读取
+    bool getRowByKey(int key, Row& row);   // 按主键值走索引读取
 
-    /**
-     * @brief 根据行号查找数据（全表扫描基础）
-     */
-    bool getRow(long rowId, Row& row);
-
-    /**
-     * @brief 获取表结构信息
-     */
     const MyVector<ColumnSchema>& getSchema() const;
 };
 

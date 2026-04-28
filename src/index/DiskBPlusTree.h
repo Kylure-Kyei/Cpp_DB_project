@@ -10,17 +10,16 @@ using KeyType = int;
 using ValueType = int;
 static constexpr uint32_t INVALID_PAGE = 0xFFFFFFFF;
 
-// ---- 磁盘节点结构（变长内容序列化到 4KB 页） ----
+// ---- 磁盘节点结构 ----
 struct DiskBPlusNode {
     MyVector<KeyType> keys;
-    MyVector<ValueType> values;          // 仅叶子
-    MyVector<uint32_t> childPages;      // 内部节点使用
-    uint32_t nextPage;                  // 叶子链表
+    MyVector<ValueType> values;
+    MyVector<uint32_t> childPages;
+    uint32_t nextPage;
     bool isLeaf;
 
     DiskBPlusNode(bool leaf = true) : nextPage(INVALID_PAGE), isLeaf(leaf) {}
 
-    // 序列化到 buffer（调用者保证 buffer 大小 >= PageManager::PAGE_SIZE）
     void serialize(char* buffer) const {
         size_t offset = 0;
         buffer[offset++] = isLeaf ? 1 : 0;
@@ -43,7 +42,6 @@ struct DiskBPlusNode {
         for (size_t i = 0; i < childCount; ++i) {
             memcpy(buffer + offset, &childPages[i], sizeof(uint32_t)); offset += sizeof(uint32_t);
         }
-        // 余下字节保持零（调用前 memset 了缓冲区）
     }
 
     static DiskBPlusNode deserialize(const char* buffer) {
@@ -73,13 +71,13 @@ struct DiskBPlusNode {
     }
 };
 
-// ---- 磁盘 B+ 树 ----
+// ---- 磁盘 B+ 树（含删除） ----
 class DiskBPlusTree {
 public:
-    DiskBPlusTree(PageManager* pm, size_t order = 4)
-        : order_(order), rootPage_(INVALID_PAGE), pageManager_(pm) {}
+    DiskBPlusTree(PageManager* pm, size_t order = 4) : order_(order), rootPage_(INVALID_PAGE), pageManager_(pm) {}
 
     void insert(KeyType key, ValueType value);
+    bool remove(KeyType key);  // 删除
     std::optional<ValueType> search(KeyType key);
     MyVector<ValueType> range_query(KeyType start, KeyType end);
 
@@ -90,28 +88,29 @@ private:
     uint32_t rootPage_;
     PageManager* pageManager_;
 
-    // 查找键所在的叶子页号
+    // 节点最小键数（根据阶数计算）
+    size_t minKeys() const { return (order_ - 1) / 2; }       // 叶子节点
+    size_t minInternalKeys() const { return minKeys(); }      // 内部节点也可一样，为避免太复杂
+
     uint32_t findLeaf(KeyType key);
-
-    // 分裂叶子
     void splitLeaf(uint32_t leafPage);
-
-    // 分裂内部节点
     void splitInternal(uint32_t nodePage);
-
-    // 将键和右子页插入父节点
     void insertIntoParent(uint32_t leftPage, KeyType key, uint32_t rightPage);
-
-    // 查找子节点的父节点页号
     uint32_t findParent(uint32_t childPage);
-
-    // 递归查找父节点
     uint32_t findParentRecursive(uint32_t currentPage, uint32_t targetPage);
+
+    // 删除辅助
+    void removeFromLeaf(uint32_t leafPage, KeyType key);
+    void borrowFromLeftSibling(uint32_t nodePage, uint32_t parentPage, size_t childIndex);
+    void borrowFromRightSibling(uint32_t nodePage, uint32_t parentPage, size_t childIndex);
+    void mergeWithSibling(uint32_t nodePage, uint32_t parentPage, size_t childIndex);
+    void adjustRoot();  // 如果根节点变空，调整根
 };
 
 // -------------------- 实现 --------------------
 
-uint32_t DiskBPlusTree::findLeaf(KeyType key) {
+// 插入相关（未变）
+inline uint32_t DiskBPlusTree::findLeaf(KeyType key) {
     if (rootPage_ == INVALID_PAGE) return INVALID_PAGE;
     uint32_t current = rootPage_;
     while (true) {
@@ -119,16 +118,14 @@ uint32_t DiskBPlusTree::findLeaf(KeyType key) {
         pageManager_->readPage(current, buf);
         DiskBPlusNode node = DiskBPlusNode::deserialize(buf);
         if (node.isLeaf) return current;
-        // 内部节点：找到 key 应进入的子页
         size_t i = 0;
         while (i < node.keys.size() && key >= node.keys[i]) ++i;
         current = node.childPages[i];
     }
 }
 
-void DiskBPlusTree::insert(KeyType key, ValueType value) {
+inline void DiskBPlusTree::insert(KeyType key, ValueType value) {
     if (rootPage_ == INVALID_PAGE) {
-        // 创建根叶子
         rootPage_ = pageManager_->allocatePage();
         DiskBPlusNode leaf(true);
         leaf.keys.push_back(key);
@@ -144,10 +141,9 @@ void DiskBPlusTree::insert(KeyType key, ValueType value) {
     pageManager_->readPage(leafPage, buf);
     DiskBPlusNode leaf = DiskBPlusNode::deserialize(buf);
 
-    // 检查键是否已存在
     for (size_t i = 0; i < leaf.keys.size(); ++i) {
         if (leaf.keys[i] == key) {
-            leaf.values[i] = value; // 更新
+            leaf.values[i] = value;
             memset(buf, 0, PageManager::PAGE_SIZE);
             leaf.serialize(buf);
             pageManager_->writePage(leafPage, buf);
@@ -155,7 +151,6 @@ void DiskBPlusTree::insert(KeyType key, ValueType value) {
         }
     }
 
-    // 插入新键值对（保持有序）
     size_t i = 0;
     while (i < leaf.keys.size() && leaf.keys[i] < key) ++i;
     leaf.keys.insert(leaf.keys.begin() + i, key);
@@ -164,36 +159,29 @@ void DiskBPlusTree::insert(KeyType key, ValueType value) {
     leaf.serialize(buf);
     pageManager_->writePage(leafPage, buf);
 
-    // 检查分裂
     if (leaf.keys.size() >= order_) {
         splitLeaf(leafPage);
     }
 }
 
-void DiskBPlusTree::splitLeaf(uint32_t leafPage) {
+inline void DiskBPlusTree::splitLeaf(uint32_t leafPage) {
     char buf[PageManager::PAGE_SIZE] = {0};
     pageManager_->readPage(leafPage, buf);
     DiskBPlusNode leaf = DiskBPlusNode::deserialize(buf);
-
     size_t mid = leaf.keys.size() / 2;
     DiskBPlusNode newLeaf(true);
-    // 移动后半部分键值对到新叶子
     for (size_t i = mid; i < leaf.keys.size(); ++i) {
         newLeaf.keys.push_back(leaf.keys[i]);
         newLeaf.values.push_back(leaf.values[i]);
     }
-    // 回缩原叶子
     while (leaf.keys.size() > mid) {
         leaf.keys.pop_back();
         leaf.values.pop_back();
     }
-
-    // 维护链表
     uint32_t newPage = pageManager_->allocatePage();
     newLeaf.nextPage = leaf.nextPage;
     leaf.nextPage = newPage;
 
-    // 写回两个叶子
     memset(buf, 0, PageManager::PAGE_SIZE);
     leaf.serialize(buf);
     pageManager_->writePage(leafPage, buf);
@@ -201,13 +189,11 @@ void DiskBPlusTree::splitLeaf(uint32_t leafPage) {
     newLeaf.serialize(buf);
     pageManager_->writePage(newPage, buf);
 
-    // 提升第一个键到父节点
     insertIntoParent(leafPage, newLeaf.keys[0], newPage);
 }
 
-void DiskBPlusTree::insertIntoParent(uint32_t leftPage, KeyType key, uint32_t rightPage) {
+inline void DiskBPlusTree::insertIntoParent(uint32_t leftPage, KeyType key, uint32_t rightPage) {
     if (leftPage == rootPage_) {
-        // 创建新根
         uint32_t newRoot = pageManager_->allocatePage();
         DiskBPlusNode newRootNode(false);
         newRootNode.keys.push_back(key);
@@ -225,10 +211,8 @@ void DiskBPlusTree::insertIntoParent(uint32_t leftPage, KeyType key, uint32_t ri
     pageManager_->readPage(parentPage, buf);
     DiskBPlusNode parent = DiskBPlusNode::deserialize(buf);
 
-    // 找到 leftPage 在父节点子页数组中的位置，key 插入到该位置之后
     size_t i = 0;
     while (i < parent.childPages.size() && parent.childPages[i] != leftPage) ++i;
-    // 插入 key 和 rightPage
     parent.keys.insert(parent.keys.begin() + i, key);
     parent.childPages.insert(parent.childPages.begin() + i + 1, rightPage);
 
@@ -241,14 +225,13 @@ void DiskBPlusTree::insertIntoParent(uint32_t leftPage, KeyType key, uint32_t ri
     }
 }
 
-void DiskBPlusTree::splitInternal(uint32_t nodePage) {
+inline void DiskBPlusTree::splitInternal(uint32_t nodePage) {
     char buf[PageManager::PAGE_SIZE] = {0};
     pageManager_->readPage(nodePage, buf);
     DiskBPlusNode node = DiskBPlusNode::deserialize(buf);
 
     size_t mid = node.keys.size() / 2;
     DiskBPlusNode newNode(false);
-    // 移动 mid 之后的键和子页到新节点
     for (size_t i = mid + 1; i < node.keys.size(); ++i) {
         newNode.keys.push_back(node.keys[i]);
     }
@@ -256,16 +239,13 @@ void DiskBPlusTree::splitInternal(uint32_t nodePage) {
         newNode.childPages.push_back(node.childPages[i]);
     }
     KeyType midKey = node.keys[mid];
-    // 回缩原节点
     while (node.keys.size() > mid) node.keys.pop_back();
     while (node.childPages.size() > mid + 1) node.childPages.pop_back();
 
     uint32_t newPage = pageManager_->allocatePage();
-    // 写回原节点
     memset(buf, 0, PageManager::PAGE_SIZE);
     node.serialize(buf);
     pageManager_->writePage(nodePage, buf);
-    // 写回新节点
     memset(buf, 0, PageManager::PAGE_SIZE);
     newNode.serialize(buf);
     pageManager_->writePage(newPage, buf);
@@ -273,12 +253,12 @@ void DiskBPlusTree::splitInternal(uint32_t nodePage) {
     insertIntoParent(nodePage, midKey, newPage);
 }
 
-uint32_t DiskBPlusTree::findParent(uint32_t childPage) {
+inline uint32_t DiskBPlusTree::findParent(uint32_t childPage) {
     if (rootPage_ == childPage) return INVALID_PAGE;
     return findParentRecursive(rootPage_, childPage);
 }
 
-uint32_t DiskBPlusTree::findParentRecursive(uint32_t currentPage, uint32_t targetPage) {
+inline uint32_t DiskBPlusTree::findParentRecursive(uint32_t currentPage, uint32_t targetPage) {
     char buf[PageManager::PAGE_SIZE] = {0};
     pageManager_->readPage(currentPage, buf);
     DiskBPlusNode node = DiskBPlusNode::deserialize(buf);
@@ -291,7 +271,7 @@ uint32_t DiskBPlusTree::findParentRecursive(uint32_t currentPage, uint32_t targe
     return INVALID_PAGE;
 }
 
-std::optional<ValueType> DiskBPlusTree::search(KeyType key) {
+inline std::optional<ValueType> DiskBPlusTree::search(KeyType key) {
     if (rootPage_ == INVALID_PAGE) return std::nullopt;
     uint32_t leafPage = findLeaf(key);
     char buf[PageManager::PAGE_SIZE] = {0};
@@ -303,7 +283,7 @@ std::optional<ValueType> DiskBPlusTree::search(KeyType key) {
     return std::nullopt;
 }
 
-MyVector<ValueType> DiskBPlusTree::range_query(KeyType start, KeyType end) {
+inline MyVector<ValueType> DiskBPlusTree::range_query(KeyType start, KeyType end) {
     MyVector<ValueType> result;
     if (rootPage_ == INVALID_PAGE) return result;
     uint32_t leafPage = findLeaf(start);
@@ -321,4 +301,309 @@ MyVector<ValueType> DiskBPlusTree::range_query(KeyType start, KeyType end) {
     return result;
 }
 
-#endif // DISK_BPLUS_TREE_H
+// ============ 删除相关实现 ============
+
+// 从叶子节点中删除键
+inline void DiskBPlusTree::removeFromLeaf(uint32_t leafPage, KeyType key) {
+    char buf[PageManager::PAGE_SIZE] = {0};
+    pageManager_->readPage(leafPage, buf);
+    DiskBPlusNode leaf = DiskBPlusNode::deserialize(buf);
+    
+    size_t idx = 0;
+    while (idx < leaf.keys.size() && leaf.keys[idx] != key) idx++;
+    if (idx == leaf.keys.size()) return; // 没找到，不应发生
+    
+        // 手动删除 keys[idx]：向前移动后续元素
+    for (size_t i = idx; i < leaf.keys.size() - 1; ++i) {
+        leaf.keys[i] = leaf.keys[i + 1];
+    }
+    leaf.keys.pop_back();
+    // 同样处理 values
+    for (size_t i = idx; i < leaf.values.size() - 1; ++i) {
+        leaf.values[i] = leaf.values[i + 1];
+    }
+    leaf.values.pop_back();
+
+    memset(buf, 0, PageManager::PAGE_SIZE);
+    leaf.serialize(buf);
+    pageManager_->writePage(leafPage, buf);
+}
+
+// 删除主流程
+inline bool DiskBPlusTree::remove(KeyType key) {
+    if (rootPage_ == INVALID_PAGE) return false;
+    uint32_t leafPage = findLeaf(key);
+    if (leafPage == INVALID_PAGE) return false;
+    
+    // 检查键是否存在
+    bool found = false;
+    {
+        char buf[PageManager::PAGE_SIZE] = {0};
+        pageManager_->readPage(leafPage, buf);
+        DiskBPlusNode leaf = DiskBPlusNode::deserialize(buf);
+        for (size_t i = 0; i < leaf.keys.size(); ++i) {
+            if (leaf.keys[i] == key) { found = true; break; }
+        }
+    }
+    if (!found) return false;
+
+    // 从叶子删除
+    removeFromLeaf(leafPage, key);
+
+    // 处理可能的不平衡
+    // 如果根节点是叶子，且为空，则清空树
+    if (leafPage == rootPage_) {
+        char buf[PageManager::PAGE_SIZE] = {0};
+        pageManager_->readPage(rootPage_, buf);
+        DiskBPlusNode root = DiskBPlusNode::deserialize(buf);
+        if (root.keys.empty()) {
+            rootPage_ = INVALID_PAGE;
+        }
+        return true;
+    }
+
+    // 检查叶子节点是否需要合并或借用
+    uint32_t parentPage = findParent(leafPage);
+    if (parentPage == INVALID_PAGE) return true; // 安全保护
+
+    while (true) {
+        char buf[PageManager::PAGE_SIZE] = {0};
+        pageManager_->readPage(parentPage, buf);
+        DiskBPlusNode parent = DiskBPlusNode::deserialize(buf);
+
+        // 找到该叶子在父节点中的索引
+        size_t childIndex = 0;
+        while (childIndex < parent.childPages.size() && parent.childPages[childIndex] != leafPage) childIndex++;
+        if (childIndex == parent.childPages.size()) break; // 未找到
+
+        // 读取叶子节点
+        pageManager_->readPage(leafPage, buf);
+        DiskBPlusNode leaf = DiskBPlusNode::deserialize(buf);
+
+        // 检查是否需要借或合并
+        if (leaf.keys.size() >= minKeys()) break; // 节点键数足够，平衡结束
+
+        // 先尝试向左兄弟借
+        if (childIndex > 0) {
+            uint32_t leftSiblingPage = parent.childPages[childIndex - 1];
+            pageManager_->readPage(leftSiblingPage, buf);
+            DiskBPlusNode leftSibling = DiskBPlusNode::deserialize(buf);
+            if (leftSibling.keys.size() > minKeys()) {
+                borrowFromLeftSibling(leafPage, parentPage, childIndex);
+                break; // 借到之后，通常就平衡了
+            }
+        }
+        // 再尝试向右兄弟借
+        if (childIndex < parent.childPages.size() - 1) {
+            uint32_t rightSiblingPage = parent.childPages[childIndex + 1];
+            pageManager_->readPage(rightSiblingPage, buf);
+            DiskBPlusNode rightSibling = DiskBPlusNode::deserialize(buf);
+            if (rightSibling.keys.size() > minKeys()) {
+                borrowFromRightSibling(leafPage, parentPage, childIndex);
+                break;
+            }
+        }
+        // 两个兄弟都不够借，执行合并
+        // 优先和左兄弟合并，如果没有左兄弟则和右兄弟合并
+        if (childIndex > 0) {
+            mergeWithSibling(leafPage, parentPage, childIndex); // 合并到左兄弟
+        } else {
+            mergeWithSibling(leafPage, parentPage, childIndex); // 与右兄弟合并（此时 childIndex==0）
+        }
+
+        // 合并后父节点可能变少，向上递归调整
+        leafPage = parentPage;
+        parentPage = findParent(parentPage);
+        if (parentPage == INVALID_PAGE) {
+            adjustRoot();
+            break;
+        }
+    }
+    return true;
+}
+
+// 向左兄弟借一个键值对
+inline void DiskBPlusTree::borrowFromLeftSibling(uint32_t nodePage, uint32_t parentPage, size_t childIndex) {
+    // nodePage 是当前节点，childIndex 是它在父节点 childPages 中的位置
+    // 左兄弟一定是叶子（当前是叶子，兄弟也是叶子），对于内部节点暂不实现（树目前仅支持叶子删除）
+    char buf[PageManager::PAGE_SIZE] = {0};
+    
+    // 读取左兄弟
+    uint32_t leftPage = 0;
+    {
+        pageManager_->readPage(parentPage, buf);
+        DiskBPlusNode parent = DiskBPlusNode::deserialize(buf);
+        leftPage = parent.childPages[childIndex - 1];
+    }
+    pageManager_->readPage(leftPage, buf);
+    DiskBPlusNode leftSibling = DiskBPlusNode::deserialize(buf);
+    pageManager_->readPage(nodePage, buf);
+    DiskBPlusNode node = DiskBPlusNode::deserialize(buf);
+
+    // 将左兄弟的最后一个键值移到当前节点最前面
+    KeyType moveKey = leftSibling.keys.back();
+    ValueType moveVal = leftSibling.values.back();
+    node.keys.insert(node.keys.begin(), moveKey);
+    node.values.insert(node.values.begin(), moveVal);
+    leftSibling.keys.pop_back();
+    leftSibling.values.pop_back();
+
+    // 更新父节点中的分隔键（即当前节点第一个键要更新？）
+    // 对于叶子节点，父节点中的分隔键通常是当前节点的第一个键，我们保持父节点不变？
+    // 实际上从左边借，当前节点的第一个键改变了，需要更新父节点中对应分隔键为该新的第一个键
+    {
+        pageManager_->readPage(parentPage, buf);
+        DiskBPlusNode parent = DiskBPlusNode::deserialize(buf);
+        parent.keys[childIndex - 1] = node.keys[0]; // 分隔键是左兄弟最大键（即 new first key of node? 让我们思考）
+        // 在 B+ 树中，父节点中索引 i 的键实际上存储的是子节点 i 的最后一个键（或其右子树的第一个键？）
+        // 常见实现：对于叶子，父节点的 key[i] 是子节点 i 的最大键（或者子节点 i 的最大键？）
+        // 我们目前在 insertIntoParent 中是将提升键（新叶子的第一个键）插入父节点。
+        // 那么父节点中 key[i] 表示子节点 i+1 的第一个键。在分裂叶子时，newLeaf.keys[0] 插入父节点，这意味着父键将左子树和右子树分开：左子树所有键 < parent.key, 右子树 >= parent.key。
+        // 当从左兄弟借键时，我们将左兄弟的最后一个键移到当前节点，左兄弟的最后一个键不再是其最大键，而当前节点原来的第一个键不再是其最小键。
+        // 父节点中分隔键应该是左兄弟的最大键（即左兄弟移走后的新最大键），还是当前节点移动后新的最小键？
+        // 按照 B+ 树定义，父键通常存储的是左子树的最大键。如果从左兄弟借走最后一个键，左兄弟的最大键变小了，因此父节点中分隔键需要更新为左兄弟新的最大键。
+        // 所以我们更新 parent.keys[childIndex - 1] = leftSibling.keys.back()（左兄弟移走后的最大键）
+        parent.keys[childIndex - 1] = leftSibling.keys.back();
+        memset(buf, 0, PageManager::PAGE_SIZE);
+        parent.serialize(buf);
+        pageManager_->writePage(parentPage, buf);
+    }
+
+    // 写回节点
+    memset(buf, 0, PageManager::PAGE_SIZE);
+    leftSibling.serialize(buf);
+    pageManager_->writePage(leftPage, buf);
+    memset(buf, 0, PageManager::PAGE_SIZE);
+    node.serialize(buf);
+    pageManager_->writePage(nodePage, buf);
+}
+
+// 向右兄弟借一个键值对
+inline void DiskBPlusTree::borrowFromRightSibling(uint32_t nodePage, uint32_t parentPage, size_t childIndex) {
+    char buf[PageManager::PAGE_SIZE] = {0};
+    uint32_t rightPage = 0;
+    {
+        pageManager_->readPage(parentPage, buf);
+        DiskBPlusNode parent = DiskBPlusNode::deserialize(buf);
+        rightPage = parent.childPages[childIndex + 1];
+    }
+    pageManager_->readPage(rightPage, buf);
+    DiskBPlusNode rightSibling = DiskBPlusNode::deserialize(buf);
+    pageManager_->readPage(nodePage, buf);
+    DiskBPlusNode node = DiskBPlusNode::deserialize(buf);
+
+    // 将右兄弟的第一个键值移到当前节点最后
+    KeyType moveKey = rightSibling.keys[0];
+    ValueType moveVal = rightSibling.values[0];
+    node.keys.push_back(moveKey);
+    node.values.push_back(moveVal);
+    // 从右兄弟中移除第一个
+    for (size_t i = 0; i < rightSibling.keys.size() - 1; ++i) {
+        rightSibling.keys[i] = rightSibling.keys[i + 1];
+    }
+    rightSibling.keys.pop_back();
+    for (size_t i = 0; i < rightSibling.values.size() - 1; ++i) {
+        rightSibling.values[i] = rightSibling.values[i + 1];
+    }
+    rightSibling.values.pop_back();
+
+    // 更新父节点分隔键（childIndex 处的键），它代表当前节点（node）的最大键，移动后当前节点多了一个键，最大键变了，可能是新增的那个键？但新增的键来自右兄弟的第一个键，比当前节点原最大键大，所以当前节点最大键就是新增键。父键应更新为 node.keys.back()。
+    {
+        pageManager_->readPage(parentPage, buf);
+        DiskBPlusNode parent = DiskBPlusNode::deserialize(buf);
+        parent.keys[childIndex] = node.keys.back();  // 当前节点的最大键
+        memset(buf, 0, PageManager::PAGE_SIZE);
+        parent.serialize(buf);
+        pageManager_->writePage(parentPage, buf);
+    }
+
+    memset(buf, 0, PageManager::PAGE_SIZE);
+    rightSibling.serialize(buf);
+    pageManager_->writePage(rightPage, buf);
+    memset(buf, 0, PageManager::PAGE_SIZE);
+    node.serialize(buf);
+    pageManager_->writePage(nodePage, buf);
+}
+
+// 与左兄弟合并（如果 childIndex > 0，否则与右兄弟合并，这个函数根据参数调用）
+inline void DiskBPlusTree::mergeWithSibling(uint32_t nodePage, uint32_t parentPage, size_t childIndex) {
+    char buf[PageManager::PAGE_SIZE] = {0};
+    pageManager_->readPage(parentPage, buf);
+    DiskBPlusNode parent = DiskBPlusNode::deserialize(buf);
+    
+    uint32_t siblingPage;
+    bool isLeftMerge = (childIndex > 0);
+    if (isLeftMerge) {
+        siblingPage = parent.childPages[childIndex - 1];
+    } else {
+        siblingPage = parent.childPages[childIndex + 1];
+    }
+    
+    // 读取两个节点
+    pageManager_->readPage(nodePage, buf);
+    DiskBPlusNode node = DiskBPlusNode::deserialize(buf);
+    memset(buf, 0, PageManager::PAGE_SIZE);
+    pageManager_->readPage(siblingPage, buf);
+    DiskBPlusNode sibling = DiskBPlusNode::deserialize(buf);
+    
+    // 合并：将 node 的所有键值对加到 sibling 的尾部
+    if (isLeftMerge) {
+        // 将 node 的内容合并到左兄弟
+        for (size_t i = 0; i < node.keys.size(); ++i) {
+            sibling.keys.push_back(node.keys[i]);
+            sibling.values.push_back(node.values[i]);
+        }
+        // 更新叶子链表：左兄弟的 next 指向 node 的 next
+        sibling.nextPage = node.nextPage;
+        // 写回左兄弟
+        memset(buf, 0, PageManager::PAGE_SIZE);
+        sibling.serialize(buf);
+        pageManager_->writePage(siblingPage, buf);
+        // 从父节点中删除分隔键和右子页（node）
+        // MyVector 无 remove，手动移除
+        for (size_t i = childIndex - 1; i < parent.keys.size() - 1; ++i) parent.keys[i] = parent.keys[i + 1];
+        parent.keys.pop_back();
+        // 移除 childPages 中的 node 页（索引 childIndex）
+        for (size_t i = childIndex; i < parent.childPages.size() - 1; ++i) parent.childPages[i] = parent.childPages[i + 1];
+        parent.childPages.pop_back();
+    } else {
+        // 将右兄弟的内容合并到 node（当前节点），然后删除右兄弟
+        for (size_t i = 0; i < sibling.keys.size(); ++i) {
+            node.keys.push_back(sibling.keys[i]);
+            node.values.push_back(sibling.values[i]);
+        }
+        node.nextPage = sibling.nextPage;
+        // 写回 node
+        memset(buf, 0, PageManager::PAGE_SIZE);
+        node.serialize(buf);
+        pageManager_->writePage(nodePage, buf);
+        // 从父节点中删除分隔键和右兄弟页 
+        for (size_t i = childIndex; i < parent.keys.size() - 1; ++i) parent.keys[i] = parent.keys[i + 1];
+        parent.keys.pop_back();
+        for (size_t i = childIndex + 1; i < parent.childPages.size() - 1; ++i) parent.childPages[i] = parent.childPages[i + 1];
+        parent.childPages.pop_back();
+    }
+
+    // 写回父节点
+    memset(buf, 0, PageManager::PAGE_SIZE);
+    parent.serialize(buf);
+    pageManager_->writePage(parentPage, buf);
+
+    // 如果父节点是根且变空，则调整根
+    if (parentPage == rootPage_ && parent.keys.empty()) {
+        if (isLeftMerge) rootPage_ = siblingPage;
+        else rootPage_ = nodePage;
+    }
+}
+
+// 调整根（若根节点为空且非叶子，用子节点作为新根）
+inline void DiskBPlusTree::adjustRoot() {
+    if (rootPage_ == INVALID_PAGE) return;
+    char buf[PageManager::PAGE_SIZE] = {0};
+    pageManager_->readPage(rootPage_, buf);
+    DiskBPlusNode root = DiskBPlusNode::deserialize(buf);
+    if (!root.isLeaf && root.keys.empty()) {
+        rootPage_ = root.childPages[0];
+    }
+}
+#endif
