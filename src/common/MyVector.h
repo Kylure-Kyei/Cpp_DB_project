@@ -2,7 +2,9 @@
 #define MY_VECTOR_H
 
 #include <iostream>
+#include "common/Logger.h"
 #include <stdexcept>
+#include "common/Logger.h"
 
 template <typename T>
 class MyVector {
@@ -21,6 +23,10 @@ public:
     // 3. 拷贝构造函数
     MyVector(const MyVector& other);
 
+    T* data() { 
+        return data_; 
+    }
+
     // 4. 赋值运算符
     MyVector& operator=(const MyVector& other);
 
@@ -29,6 +35,8 @@ public:
 
     // 6. 获取大小
     size_t size() const;
+
+    void resize(size_t new_size);
 
     // 7. 判断是否为空
     bool empty() const;
@@ -45,6 +53,27 @@ public:
 
     // 11. 移除最后一个
     void pop_back();
+    // 返回指向第一个元素的迭代器
+    T* begin() { return data_; }
+
+    // 在指定位置插入元素
+    void insert(T* position, const T& value) {
+        size_t index = position - data_;
+        if (size_ >= capacity_) {
+            size_t new_capacity = (capacity_ == 0) ? 4 : capacity_ * 2;
+            T* new_data = new T[new_capacity];
+            for (size_t i = 0; i < index; ++i) { new_data[i] = data_[i]; }
+            for (size_t i = index; i < size_; ++i) { new_data[i + 1] = data_[i]; }
+            delete[] data_;
+            data_ = new_data;
+            capacity_ = new_capacity;
+        } else {
+            for (size_t i = size_; i > index; --i) { data_[i] = data_[i - 1]; }
+        }
+        data_[index] = value;
+        ++size_;
+    }
+
 };
 
 // 下面是具体实现
@@ -100,6 +129,23 @@ size_t MyVector<T>::size() const {
     return size_;
 }
 
+template<typename T>
+void MyVector<T>::resize(size_t new_size) {
+    if (new_size <= capacity_) {
+        size_ = new_size;
+        return;
+    }
+    // 扩容逻辑
+    T* new_data = new T[new_size];
+    for (size_t i = 0; i < size_; ++i) {
+        new_data[i] = data_[i];
+    }
+    delete[] data_;
+    data_ = new_data;
+    capacity_ = new_size;
+    size_ = new_size;
+}
+
 template <typename T>
 bool MyVector<T>::empty() const {
     return size_ == 0;
@@ -137,5 +183,8 @@ void MyVector<T>::pop_back() {
         --size_;
     }
 }
+
+
+
 
 #endif // MY_VECTOR_H

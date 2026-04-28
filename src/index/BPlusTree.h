@@ -1,9 +1,12 @@
 #ifndef BPLUS_TREE_H
 #define BPLUS_TREE_H
 
-#include "MyVector.h"
+#include "../common/MyVector.h"
+#include "common/Logger.h"
 #include <iostream>
+#include "common/Logger.h"
 #include <optional>
+#include "common/Logger.h"
 
 // B+树节点
 template <typename K, typename V>
@@ -14,7 +17,7 @@ struct BPlusNode {
     BPlusNode* next;            // 叶子节点的链表指针
     bool is_leaf;               // 是否是叶子节点
 
-    BPlusNode(bool leaf = true) : is_leaf(leaf), next(nullptr) {}
+    BPlusNode(bool leaf = true) : next(nullptr), is_leaf(leaf) {}
 };
 
 template <typename K, typename V>
@@ -57,16 +60,13 @@ private:
         K mid_key = node->keys[mid];
         node->keys.pop_back();
         
-        if (node == root_) {
+            if (node == root_) {
             BPlusNode<K, V>* new_root = new BPlusNode<K, V>(false);
             new_root->keys.push_back(mid_key);
             new_root->children.push_back(node);
             new_root->children.push_back(new_node);
             root_ = new_root;
         } else {
-            BPlusNode<K, V>* parent = nullptr;
-            // 找到父节点
-            // 这里简化处理，实际应该维护parent指针
             insert_into_parent(node, mid_key, new_node);
         }
     }
@@ -102,6 +102,20 @@ private:
     BPlusNode<K, V>* find_parent(BPlusNode<K, V>* child) {
         if (root_ == child) return nullptr;
         // 这里简化处理，实际应该从根遍历查找
+        return nullptr;
+    }
+
+    
+
+    BPlusNode<K, V>* find_parent_recursive(BPlusNode<K, V>* current, BPlusNode<K, V>* target) {
+        if (current == nullptr || current->is_leaf) return nullptr;
+        for (size_t i = 0; i < current->children.size(); ++i) {
+            if (current->children[i] == target) {
+                return current;
+            }
+            BPlusNode<K, V>* found = find_parent_recursive(current->children[i], target);
+            if (found) return found;
+        }
         return nullptr;
     }
 
